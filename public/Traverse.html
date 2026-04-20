@@ -58,6 +58,19 @@
 <script type="text/babel">
 const { useState, useEffect } = React;
 
+// ── Status views ───────────────────────────────────────────────────
+const LoadingView = () => (
+  <div className="flex-1 flex items-center justify-center" style={{ backgroundColor: "#F4F1EA" }}>
+    <p className="font-mono text-xs tracking-widest uppercase" style={{ color: "#7A8471" }}>Loading…</p>
+  </div>
+);
+
+const EmptyView = ({ message }) => (
+  <div className="flex-1 flex items-center justify-center" style={{ backgroundColor: "#F4F1EA" }}>
+    <p className="font-mono text-sm" style={{ color: "#7A8471" }}>{message}</p>
+  </div>
+);
+
 // Nav items
 const NAV = [
   { id: "trips",  label: "Trips",
@@ -70,34 +83,122 @@ const NAV = [
 
 function App() {
   const [screen, setScreen] = useState(() => localStorage.getItem("traverse_screen") || "trips");
+  const [trips, setTrips] = useState([]);
+  const [gearLibrary, setGearLibrary] = useState([]);
+  const [templates, setTemplates] = useState([]);
   const [activeTrip, setActiveTrip] = useState(null);
   const [showNewTrip, setShowNewTrip] = useState(false);
-  const [checkedGear, setCheckedGear] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("traverse_gear") || "{}"); } catch { return {}; }
-  });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => { localStorage.setItem("traverse_screen", screen); }, [screen]);
-  useEffect(() => { localStorage.setItem("traverse_gear", JSON.stringify(checkedGear)); }, [checkedGear]);
 
-  const toggleGear = (id) => setCheckedGear(g => ({ ...g, [id]: !g[id] }));
+  const refreshAll = async () => {
+    try {
+      const [t, g, tpl] = await Promise.all([
+        TraverseAPI.listTrips(),
+        TraverseAPI.listGear(),
+        TraverseAPI.listTemplates(),
+      ]);
+      setTrips(t);
+      setGearLibrary(g);
+      setTemplates(tpl);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
 
-  const mainTrip = DEMO_DATA.trips[0];
+  useEffect(() => {
+    setLoading(true);
+    refreshAll().finally(() => setLoading(false));
+  }, []);
+
+  const openTrip = async (tripSummary) => {
+    try {
+      const full = await TraverseAPI.getTrip(tripSummary.id);
+      setActiveTrip(full);
+    } catch (e) { setError(e.message); }
+  };
+
+  const refreshActiveTrip = async () => {
+    if (!activeTrip) return;
+    const full = await TraverseAPI.getTrip(activeTrip.id);
+    setActiveTrip(full);
+  };
+
+  const onTogglePacked = async (tripGearId, packed) => {
+    if (!activeTrip) return;
+    // Optimistic
+    setActiveTrip(t => ({
+      ...t,
+      gear: t.gear.map(g => g.id === tripGearId ? { ...g, packed } : g),
+    }));
+    try { await TraverseAPI.toggleTripGear(activeTrip.id, tripGearId, packed); }
+    catch (e) { setError(e.message); refreshActiveTrip(); }
+  };
+
+  const onCreateTrip = async (data) => {
+    const created = await TraverseAPI.createTrip(data);
+    await refreshAll();
+    return created;
+  };
+
+  const onAddGearToLibrary = async (gearData) => {
+    await TraverseAPI.addGear(gearData);
+    await refreshAll();
+  };
+
+  const onAddGearToActiveTrip = async (gearItemId) => {
+    if (!activeTrip) return;
+    await TraverseAPI.addTripGear(activeTrip.id, gearItemId);
+    await refreshActiveTrip();
+  };
+
+  const onUpdateSegment = async (segId, patch) => {
+    if (!activeTrip) return;
+    await TraverseAPI.patchSegment(activeTrip.id, segId, patch);
+    await refreshActiveTrip();
+  };
+
+  const onToggleTracking = async (enable) => {
+    if (!activeTrip) return;
+    if (enable) await TraverseAPI.enableTracking(activeTrip.id);
+    else await TraverseAPI.disableTracking(activeTrip.id);
+    await refreshActiveTrip();
+    await refreshAll();
+  };
 
   const handleNavChange = (id) => {
     setScreen(id);
     setActiveTrip(null);
   };
 
-  // Determine current main content
+  const upcomingTrip = trips.find(t => t.status === "upcoming") || trips[0];
+  const mainTrip = activeTrip || upcomingTrip;
+
   let content;
-  if (screen === "trips" && activeTrip) {
-    content = <TripDetail trip={activeTrip} onBack={() => setActiveTrip(null)} checkedGear={checkedGear} onToggleGear={toggleGear} />;
+  if (loading && !trips.length) {
+    content = <LoadingView />;
+  } else if (screen === "trips" && activeTrip) {
+    content = <TripDetail
+      trip={activeTrip}
+      gearLibrary={gearLibrary}
+      onBack={() => setActiveTrip(null)}
+      onTogglePacked={onTogglePacked}
+      onAddGearToTrip={onAddGearToActiveTrip}
+      onUpdateSegment={onUpdateSegment}
+      onToggleTracking={onToggleTracking}
+    />;
   } else if (screen === "trips") {
-    content = <TripsDashboard trips={DEMO_DATA.trips} onOpenTrip={setActiveTrip} onNewTrip={() => setShowNewTrip(true)} />;
+    content = <TripsDashboard trips={trips} onOpenTrip={openTrip} onNewTrip={() => setShowNewTrip(true)} />;
   } else if (screen === "gear") {
-    content = <GearLibrary />;
+    content = <GearLibrary gearLibrary={gearLibrary} onAdd={onAddGearToLibrary} />;
   } else if (screen === "export") {
-    content = <ExportView trip={mainTrip} />;
+    if (mainTrip) {
+      content = <ExportView tripId={mainTrip.id} />;
+    } else {
+      content = <EmptyView message="Open a trip to export a brief." />;
+    }
   }
 
   return (
@@ -130,12 +231,20 @@ function App() {
           })}
         </nav>
 
-        {/* Trip in progress indicator */}
-        <div className="mx-3 mb-3 p-3 rounded-lg" style={{ backgroundColor: "#1A2E1B" }}>
-          <p className="font-mono text-xs tracking-widest uppercase mb-1" style={{ color: "#7A8471" }}>Next up</p>
-          <p className="text-sm font-semibold" style={{ color: "#F4F1EA" }}>Kangaroo Valley</p>
-          <p className="font-mono text-xs mt-0.5" style={{ color: "#A64B2A" }}>26 days · 47km</p>
-        </div>
+        {/* Next up */}
+        {upcomingTrip && (
+          <div className="mx-3 mb-3 p-3 rounded-lg cursor-pointer" style={{ backgroundColor: "#1A2E1B" }}
+            onClick={() => { setScreen("trips"); openTrip(upcomingTrip); }}>
+            <p className="font-mono text-xs tracking-widest uppercase mb-1" style={{ color: "#7A8471" }}>Next up</p>
+            <p className="text-sm font-semibold" style={{ color: "#F4F1EA" }}>
+              {(upcomingTrip.name || "").split(",")[0]}
+            </p>
+            <p className="font-mono text-xs mt-0.5" style={{ color: "#A64B2A" }}>
+              {upcomingTrip.daysUntil != null ? `${upcomingTrip.daysUntil} days` : upcomingTrip.status}
+              {upcomingTrip.distance ? ` · ${upcomingTrip.distance}km` : ""}
+            </p>
+          </div>
+        )}
 
         {/* User */}
         <div className="px-5 py-5" style={{ borderTop: "1px solid #1A2E1B" }}>
@@ -144,7 +253,7 @@ function App() {
               style={{ backgroundColor: "#A64B2A", color: "#F4F1EA" }}>AH</div>
             <div>
               <p className="text-sm font-medium" style={{ color: "#F4F1EA" }}>Alex Hartley</p>
-              <p className="text-xs font-mono" style={{ color: "#7A8471" }}>3 trips planned</p>
+              <p className="text-xs font-mono" style={{ color: "#7A8471" }}>{trips.length} trips planned</p>
             </div>
           </div>
         </div>
@@ -181,8 +290,27 @@ function App() {
         })}
       </nav>
 
+      {/* Error toast */}
+      {error && (
+        <div className="fixed top-4 right-4 z-50 px-4 py-3 rounded-xl shadow-md font-mono text-xs max-w-sm"
+          style={{ backgroundColor: "#A64B2A", color: "#F4F1EA" }}
+          onClick={() => setError(null)}>
+          {error}
+        </div>
+      )}
+
       {/* New trip modal */}
-      {showNewTrip && <NewTripModal onClose={() => setShowNewTrip(false)} />}
+      {showNewTrip && (
+        <NewTripModal
+          templates={templates}
+          onClose={() => setShowNewTrip(false)}
+          onSubmit={async (data) => {
+            const trip = await onCreateTrip(data);
+            setShowNewTrip(false);
+            openTrip(trip);
+          }}
+        />
+      )}
 
       {/* Tweaks panel */}
       <TweaksPanel />

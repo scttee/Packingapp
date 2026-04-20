@@ -15,29 +15,25 @@ const AddGearPanel = ({ onClose, onAdd }) => {
     if (!input.trim()) return;
     setLoading(true); setError(null); setResult(null);
     try {
-      const raw = await window.claude.complete({
-        messages: [{
-          role: "user",
-          content: `You are a gear database for bikepacking and hiking equipment. Given this product URL or product name/description, return ONLY valid JSON — no markdown, no commentary — with these exact fields:
-{"name":"full product name","brand":"brand name","weight_g":integer,"category":"Sleep|Cook|Wear|Ride|Safety|Documents","description":"one sentence, max 12 words"}
-If weight is unknown, estimate based on product type and typical market offerings. Be specific and accurate.
-Product: ${input}`
-        }]
-      });
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
+      const parsed = await TraverseAPI.lookupGear(input);
       setResult(parsed);
       setCategory(parsed.category || "Ride");
     } catch (e) {
-      setError("Could not parse product details. Try a more specific URL or product name.");
+      setError(e.message && /configured/i.test(e.message)
+        ? "AI lookup not configured. Type details manually below, or set ANTHROPIC_API_KEY on the server."
+        : "Could not parse product details. Try a more specific URL or product name.");
     }
     setLoading(false);
   };
 
-  const confirm = () => {
+  const confirm = async () => {
     if (!result) return;
-    onAdd({ ...result, category, id: Date.now(), lastUsed: null });
-    onClose();
+    try {
+      await onAdd({ ...result, category });
+      onClose();
+    } catch (e) {
+      setError(e.message || "Could not save gear.");
+    }
   };
 
   return (
@@ -110,10 +106,19 @@ Product: ${input}`
 };
 
 // ─── Route Replanning Section ─────────────────────────────────────────
-const ReplanSection = ({ segments }) => {
-  const [active, setActive] = useState(false);
-  const [actuals, setActuals] = useState({});
+const ReplanSection = ({ segments, onSaveActual }) => {
+  const [active, setActive] = useState(() => (segments || []).some(s => s.actualKm != null));
+  const initial = {};
+  (segments || []).forEach(s => { if (s.actualKm != null) initial[s.day] = s.actualKm; });
+  const [actuals, setActuals] = useState(initial);
   const totalPlanned = segments.reduce((s, seg) => s + seg.distance, 0);
+
+  const setActual = (day, km) => {
+    setActuals(a => ({ ...a, [day]: km }));
+  };
+  const persistActual = (segId, km) => {
+    if (onSaveActual) onSaveActual(segId, km);
+  };
 
   const completedDays = Object.keys(actuals).map(Number).sort();
   const lastCompletedDay = Math.max(...completedDays, 0);
@@ -157,7 +162,9 @@ const ReplanSection = ({ segments }) => {
                   </div>
                   <input type="range" min={0} max={Math.round(seg.distance * 1.5)} step={1}
                     value={actuals[seg.day] || 0}
-                    onChange={e => setActuals(a => ({ ...a, [seg.day]: Number(e.target.value) }))}
+                    onChange={e => setActual(seg.day, Number(e.target.value))}
+                    onMouseUp={e => persistActual(seg.id, Number(e.target.value))}
+                    onTouchEnd={e => persistActual(seg.id, Number(e.target.value))}
                     className="w-full h-1 rounded-full appearance-none cursor-pointer"
                     style={{ accentColor: "#2D3E2F" }} />
                 </div>
@@ -398,19 +405,47 @@ const TripsDashboard = ({ trips, onOpenTrip, onNewTrip }) => {
 
 
 // ─── TRIP DETAIL ──────────────────────────────────────────────────────
-const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
+const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearToTrip, onUpdateSegment, onToggleTracking }) => {
   const [tab, setTab] = useState("Overview");
   const tabs = ["Overview","Route","Gear","Logistics","Live"];
-  const [trackingOn, setTrackingOn] = useState(false);
   const [importUrl, setImportUrl] = useState("");
+  const [weather, setWeather] = useState(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [showGearPicker, setShowGearPicker] = useState(false);
+  const [gpxStatus, setGpxStatus] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const fileInputRef = React.useRef(null);
   const gearCategories = ["Sleep","Cook","Wear","Ride","Safety","Documents"];
-  const gearById = {};
-  DEMO_DATA.gearLibrary.forEach(g => { gearById[g.id] = g; });
-  const templateIds = Object.values(DEMO_DATA.gearTemplate["bikepacking-3day"]).flat();
-  const tripGear = templateIds.map(id => gearById[id]).filter(Boolean);
-  const checkedItems = tripGear.filter(g => checkedGear[g.id]);
-  const totalWeight = checkedItems.reduce((s,g) => s+g.weight, 0);
-  const fullWeight = tripGear.reduce((s,g) => s+g.weight, 0);
+  const tripGear = trip.gear || [];
+  const checkedItems = tripGear.filter(g => g.packed);
+  const totalWeight = checkedItems.reduce((s,g) => s + (g.weight||0), 0);
+  const fullWeight = tripGear.reduce((s,g) => s + (g.weight||0), 0);
+  const trackingOn = !!trip.trackingEnabled;
+
+  // Derive lat/lng from the start waypoint for weather
+  const startWp = (trip.waypoints||[]).find(w => w.lat != null && w.lng != null) || {};
+  React.useEffect(() => {
+    if (!trip.dates?.start || startWp.lat == null) return;
+    setWeatherLoading(true);
+    TraverseAPI.weather(startWp.lat, startWp.lng, trip.dates.start, Math.min((trip.segments?.length||3), 7))
+      .then(setWeather).finally(() => setWeatherLoading(false));
+  }, [trip.id]);
+
+  const gearByCategory = (cat) => tripGear.filter(g => g.category === cat);
+  const gearInTripIds = new Set(tripGear.map(g => g.gearItemId));
+  const availableToAdd = gearLibrary.filter(g => !gearInTripIds.has(g.id));
+
+  const onGpxFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setGpxStatus({ kind: "loading" });
+    try {
+      const res = await TraverseAPI.uploadGpx(trip.id, f);
+      setGpxStatus({ kind: "ok", summary: res });
+    } catch (err) {
+      setGpxStatus({ kind: "error", message: err.message });
+    }
+  };
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden" style={{ backgroundColor: "#F4F1EA" }}>
@@ -477,12 +512,13 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
               <p className="text-sm leading-relaxed" style={{ color: "#1F1F1E" }}>{trip.summary}</p>
             </div>
           )}
-          {trip.weather && (
-            <div>
-              <SectionLabel>Forecast</SectionLabel>
+          <div>
+            <SectionLabel>Forecast</SectionLabel>
+            {weatherLoading && <p className="font-mono text-xs" style={{ color: "#7A8471" }}>Fetching forecast…</p>}
+            {!weatherLoading && weather && weather.length > 0 && (
               <div className="grid grid-cols-3 gap-2.5">
-                {Object.entries(trip.weather).map(([day,w],i) => (
-                  <div key={day} className="rounded-2xl p-4 text-center" style={{ backgroundColor: "#E8E2D4" }}>
+                {weather.slice(0,3).map((w,i) => (
+                  <div key={i} className="rounded-2xl p-4 text-center" style={{ backgroundColor: "#E8E2D4" }}>
                     <p className="text-xs font-mono mb-2" style={{ color: "#7A8471" }}>Day {i+1}</p>
                     <WeatherIcon icon={w.icon} />
                     <p className="font-mono text-base font-semibold mt-1.5" style={{ color: "#1F1F1E" }}>{w.temp}°</p>
@@ -491,32 +527,58 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
                   </div>
                 ))}
               </div>
-            </div>
-          )}
+            )}
+            {!weatherLoading && (!weather || weather.length === 0) && (
+              <p className="font-mono text-xs" style={{ color: "#7A8471" }}>
+                {startWp.lat == null ? "Add a waypoint with coordinates for forecast." : "Forecast unavailable for these dates."}
+              </p>
+            )}
+          </div>
         </>}
 
         {/* ROUTE */}
         {tab === "Route" && <>
           <div className="relative rounded-2xl h-52 overflow-hidden" style={{ backgroundColor: "#2D3E2F" }}>
             <TopoPattern opacity={0.15} />
-            <div className="absolute inset-0 flex items-center justify-center">
-              <p className="font-mono text-xs tracking-widest uppercase" style={{ color: "#7A8471" }}>Route map placeholder</p>
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+              <p className="font-mono text-xs tracking-widest uppercase" style={{ color: "#7A8471" }}>Route map</p>
+              <p className="font-mono text-xs" style={{ color: "#7A8471" }}>
+                {(trip.waypoints||[]).filter(w=>w.lat!=null).length} waypoints · Mapbox coming soon
+              </p>
             </div>
           </div>
           <div>
             <SectionLabel>Import route</SectionLabel>
-            <div className="flex gap-2">
-              <input value={importUrl} onChange={e => setImportUrl(e.target.value)} placeholder="Paste Komoot or Strava URL"
-                className="flex-1 px-4 py-3 rounded-xl text-sm font-mono outline-none"
-                style={{ backgroundColor: "#E8E2D4", color: "#1F1F1E" }} />
-              <button className="px-4 py-3 rounded-xl text-sm font-medium" style={{ backgroundColor: "#2D3E2F", color: "#F4F1EA" }}>Import</button>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <input value={importUrl} onChange={e => setImportUrl(e.target.value)} placeholder="Paste Komoot or Strava URL"
+                  className="flex-1 px-4 py-3 rounded-xl text-sm font-mono outline-none"
+                  style={{ backgroundColor: "#E8E2D4", color: "#1F1F1E" }} />
+                <button
+                  onClick={() => alert("Komoot / Strava import requires API credentials — coming soon")}
+                  className="px-4 py-3 rounded-xl text-sm font-medium" style={{ backgroundColor: "#2D3E2F", color: "#F4F1EA" }}>Import</button>
+              </div>
+              <input ref={fileInputRef} type="file" accept=".gpx,application/gpx+xml" className="hidden" onChange={onGpxFile} />
+              <button onClick={() => fileInputRef.current?.click()}
+                className="w-full py-3 rounded-xl text-sm font-mono flex items-center justify-center gap-2"
+                style={{ border: "1.5px dashed #D4CEC3", color: "#7A8471" }}>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M4 6l4-4 4 4M2 12h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                Upload .gpx file
+              </button>
+              {gpxStatus?.kind === "loading" && <p className="text-xs font-mono" style={{ color: "#7A8471" }}>Parsing GPX…</p>}
+              {gpxStatus?.kind === "ok" && (
+                <p className="text-xs font-mono" style={{ color: "#2D3E2F" }}>
+                  Imported · {gpxStatus.summary.distanceKm}km · ↑{gpxStatus.summary.elevationGainM}m · {gpxStatus.summary.pointCount} points
+                </p>
+              )}
+              {gpxStatus?.kind === "error" && <p className="text-xs font-mono" style={{ color: "#A64B2A" }}>GPX import failed — {gpxStatus.message}</p>}
             </div>
           </div>
           <div>
             <SectionLabel>Daily segments</SectionLabel>
             <div className="space-y-2.5">
               {(trip.segments||[]).map((seg,i) => (
-                <div key={i} className="rounded-2xl p-5" style={{ backgroundColor: "#E8E2D4" }}>
+                <div key={seg.id || i} className="rounded-2xl p-5" style={{ backgroundColor: "#E8E2D4" }}>
                   <div className="flex items-start justify-between mb-3">
                     <div>
                       <p className="text-xs font-mono mb-1" style={{ color: "#7A8471" }}>Day {seg.day}</p>
@@ -536,7 +598,7 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
           {/* Live replanning */}
           <div>
             <SectionLabel>Adjust for actual progress</SectionLabel>
-            <ReplanSection segments={trip.segments || []} />
+            <ReplanSection segments={trip.segments || []} onSaveActual={(segId, km) => onUpdateSegment && onUpdateSegment(segId, { actualKm: km })} />
           </div>
         </>}
 
@@ -561,10 +623,9 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
             </div>
           </div>
           {gearCategories.map(cat => {
-            const catIds = DEMO_DATA.gearTemplate["bikepacking-3day"][cat]||[];
-            const items = catIds.map(id => gearById[id]).filter(Boolean);
+            const items = gearByCategory(cat);
             if (!items.length) return null;
-            const catWeight = items.filter(g=>checkedGear[g.id]).reduce((s,g)=>s+g.weight,0);
+            const catWeight = items.filter(g => g.packed).reduce((s,g) => s + (g.weight||0), 0);
             return (
               <div key={cat}>
                 <div className="flex items-center justify-between mb-2.5">
@@ -573,15 +634,15 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
                 </div>
                 <div className="space-y-2">
                   {items.map(item => (
-                    <div key={item.id} onClick={() => onToggleGear(item.id)}
+                    <div key={item.id} onClick={() => onTogglePacked && onTogglePacked(item.id, !item.packed)}
                       className="flex items-center gap-3 p-4 rounded-xl cursor-pointer transition-opacity"
-                      style={{ backgroundColor: "#E8E2D4", opacity: checkedGear[item.id] ? 0.6 : 1 }}>
+                      style={{ backgroundColor: "#E8E2D4", opacity: item.packed ? 0.6 : 1 }}>
                       <div className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
-                        style={{ backgroundColor: checkedGear[item.id] ? "#2D3E2F" : "transparent", border:`1.5px solid ${checkedGear[item.id]?"#2D3E2F":"#7A8471"}` }}>
-                        {checkedGear[item.id] && <svg width="10" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 4l3 3 5-6" stroke="#F4F1EA" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                        style={{ backgroundColor: item.packed ? "#2D3E2F" : "transparent", border:`1.5px solid ${item.packed?"#2D3E2F":"#7A8471"}` }}>
+                        {item.packed && <svg width="10" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 4l3 3 5-6" stroke="#F4F1EA" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm" style={{ color: "#1F1F1E", textDecoration: checkedGear[item.id] ? "line-through" : "none" }}>{item.name}</p>
+                        <p className="text-sm" style={{ color: "#1F1F1E", textDecoration: item.packed ? "line-through" : "none" }}>{item.name}</p>
                         <p className="text-xs font-mono mt-0.5" style={{ color: "#7A8471" }}>{item.brand}</p>
                       </div>
                       <span className="font-mono text-xs flex-shrink-0" style={{ color: "#7A8471" }}>{item.weight > 0 ? `${item.weight}g` : "—"}</span>
@@ -591,6 +652,32 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
               </div>
             );
           })}
+          {availableToAdd.length > 0 && (
+            <div>
+              <button onClick={() => setShowGearPicker(v => !v)}
+                className="w-full py-3 rounded-xl text-sm font-mono flex items-center justify-center gap-2"
+                style={{ border: "1.5px dashed #D4CEC3", color: "#7A8471" }}>
+                {showGearPicker ? "Hide library" : `+ Add from library (${availableToAdd.length})`}
+              </button>
+              {showGearPicker && (
+                <div className="mt-2 space-y-1.5">
+                  {availableToAdd.map(g => (
+                    <div key={g.id} className="flex items-center justify-between p-3 rounded-xl"
+                      style={{ backgroundColor: "#E8E2D4" }}>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm" style={{ color: "#1F1F1E" }}>{g.name}</p>
+                        <p className="text-xs font-mono" style={{ color: "#7A8471" }}>{g.brand} · {g.category} · {g.weight}g</p>
+                      </div>
+                      <button onClick={() => onAddGearToTrip && onAddGearToTrip(g.id)}
+                        className="text-xs font-mono" style={{ color: "var(--accent, #A64B2A)" }}>
+                        Add
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </>}
 
         {/* LOGISTICS */}
@@ -659,12 +746,21 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
         {tab === "Live" && <>
           <div className="rounded-2xl p-5" style={{ backgroundColor: "#E8E2D4" }}>
             <SectionLabel>Location sharing</SectionLabel>
-            <Toggle on={trackingOn} onToggle={() => setTrackingOn(v=>!v)} label="Share live tracking" />
-            {trackingOn && (
+            <Toggle on={trackingOn} onToggle={() => onToggleTracking && onToggleTracking(!trackingOn)} label="Share live tracking" />
+            {trackingOn && trip.trackingLink && (
               <div className="mt-4 p-4 rounded-xl" style={{ backgroundColor: "#F4F1EA" }}>
                 <p className="text-xs font-mono mb-1.5" style={{ color: "#7A8471" }}>Shareable link</p>
                 <p className="font-mono text-xs break-all" style={{ color: "#2D3E2F" }}>{trip.trackingLink}</p>
-                <button className="mt-2 text-xs font-medium font-mono" style={{ color: "var(--accent, #A64B2A)" }}>Copy link</button>
+                <button
+                  onClick={() => {
+                    if (navigator.clipboard) {
+                      navigator.clipboard.writeText(trip.trackingLink).then(() => setCopied(true)).catch(() => {});
+                      setTimeout(() => setCopied(false), 1500);
+                    }
+                  }}
+                  className="mt-2 text-xs font-medium font-mono" style={{ color: "var(--accent, #A64B2A)" }}>
+                  {copied ? "Copied!" : "Copy link"}
+                </button>
               </div>
             )}
           </div>
@@ -679,17 +775,19 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
               </div>
             </div>
           </div>
-          <div className="rounded-2xl overflow-hidden" style={{ backgroundColor: "#E8E2D4" }}>
-            <div className="p-5">
-              <SectionLabel>Emergency contacts</SectionLabel>
-            </div>
-            {[{name:"NSW SES",number:"132 500"},{name:"Police Assistance",number:"131 444"},{name:"Sarah Chen (in-party)",number:"+61 412 xxx xxx"}].map((c,i) => (
-              <div key={c.name} className="flex items-center justify-between px-5 py-3.5" style={{ borderTop: "1px solid #D4CEC3" }}>
-                <p className="text-sm" style={{ color: "#1F1F1E" }}>{c.name}</p>
-                <p className="font-mono text-sm" style={{ color: "var(--accent, #A64B2A)" }}>{c.number}</p>
+          {(trip.emergencyContacts||[]).length > 0 && (
+            <div className="rounded-2xl overflow-hidden" style={{ backgroundColor: "#E8E2D4" }}>
+              <div className="p-5">
+                <SectionLabel>Emergency contacts</SectionLabel>
               </div>
-            ))}
-          </div>
+              {trip.emergencyContacts.map((c) => (
+                <div key={c.name} className="flex items-center justify-between px-5 py-3.5" style={{ borderTop: "1px solid #D4CEC3" }}>
+                  <p className="text-sm" style={{ color: "#1F1F1E" }}>{c.name}</p>
+                  <p className="font-mono text-sm" style={{ color: "var(--accent, #A64B2A)" }}>{c.number}</p>
+                </div>
+              ))}
+            </div>
+          )}
         </>}
       </div>
     </div>
@@ -697,20 +795,18 @@ const TripDetail = ({ trip, onBack, checkedGear, onToggleGear }) => {
 };
 
 // ─── GEAR LIBRARY ─────────────────────────────────────────────────────
-const GearLibrary = () => {
+const GearLibrary = ({ gearLibrary = [], onAdd }) => {
   const [filter, setFilter] = useState("All");
   const [showAdd, setShowAdd] = useState(false);
-  const [extraGear, setExtraGear] = useState([]);
   const categories = ["All","Sleep","Cook","Wear","Ride","Safety","Documents"];
-  const allGear = [...DEMO_DATA.gearLibrary, ...extraGear];
-  const filtered = filter === "All" ? allGear : allGear.filter(g => g.category === filter);
+  const filtered = filter === "All" ? gearLibrary : gearLibrary.filter(g => g.category === filter);
 
   return (
     <div className="flex-1 overflow-y-auto" style={{ backgroundColor: "#F4F1EA" }}>
       <div className="px-6 pt-8 pb-4" style={{ borderBottom: "1px solid #D4CEC3" }}>
         <div className="flex items-end justify-between mb-4">
           <div>
-            <p className="font-mono text-xs uppercase tracking-widest mb-1" style={{ color: "#7A8471" }}>{allGear.length} items · {(allGear.reduce((s,g)=>s+g.weight,0)/1000).toFixed(1)}kg</p>
+            <p className="font-mono text-xs uppercase tracking-widest mb-1" style={{ color: "#7A8471" }}>{gearLibrary.length} items · {(gearLibrary.reduce((s,g)=>s+(g.weight||0),0)/1000).toFixed(1)}kg</p>
             <h1 className="font-bold uppercase" style={{ fontSize: "2.6rem", lineHeight: 1, letterSpacing: "-0.03em", color: "#1F1F1E" }}>Gear</h1>
           </div>
           <button onClick={() => setShowAdd(true)}
@@ -731,10 +827,15 @@ const GearLibrary = () => {
       </div>
 
       <div className="px-6 pb-28 space-y-2.5">
+        {filtered.length === 0 && (
+          <p className="font-mono text-xs mt-6" style={{ color: "#7A8471" }}>
+            No gear in this category yet. Add some with the button above.
+          </p>
+        )}
         {filtered.map(item => (
           <div key={item.id} className="rounded-2xl p-4 flex items-center gap-4" style={{ backgroundColor: "#E8E2D4" }}>
             <div className="w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0" style={{ backgroundColor: "#F4F1EA" }}>
-              <span className="font-mono text-xs font-semibold" style={{ color: "#7A8471" }}>{item.category.slice(0,2).toUpperCase()}</span>
+              <span className="font-mono text-xs font-semibold" style={{ color: "#7A8471" }}>{(item.category||"").slice(0,2).toUpperCase()}</span>
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium leading-snug" style={{ color: "#1F1F1E" }}>{item.name}</p>
@@ -745,7 +846,6 @@ const GearLibrary = () => {
             </div>
             <div className="text-right flex-shrink-0">
               <p className="font-mono text-base font-semibold" style={{ color: "#1F1F1E" }}>{item.weight > 0 ? `${item.weight}g` : "—"}</p>
-              <button className="text-xs font-mono mt-0.5" style={{ color: "var(--accent, #A64B2A)" }}>Add to trip</button>
             </div>
           </div>
         ))}
@@ -754,7 +854,15 @@ const GearLibrary = () => {
       {showAdd && (
         <AddGearPanel
           onClose={() => setShowAdd(false)}
-          onAdd={(item) => setExtraGear(g => [...g, item])}
+          onAdd={async (item) => {
+            if (onAdd) await onAdd({
+              name: item.name,
+              brand: item.brand,
+              category: item.category,
+              weight: item.weight_g ?? item.weight ?? 0,
+              description: item.description,
+            });
+          }}
         />
       )}
     </div>
@@ -762,12 +870,51 @@ const GearLibrary = () => {
 };
 
 // ─── NEW TRIP MODAL ───────────────────────────────────────────────────
-const NewTripModal = ({ onClose }) => {
+const NewTripModal = ({ onClose, onSubmit, templates = [] }) => {
   const [step, setStep] = useState(1);
-  const [form, setForm] = useState({ name:"", startDate:"", endDate:"", type:"bike", emails:"", route:"", template:"bikepacking-3day" });
+  const [form, setForm] = useState({ name:"", country:"", startDate:"", endDate:"", type:"bike", emails:"", route:"", template: templates[0]?.name || "blank" });
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState(null);
   const totalSteps = 4;
   const stepTitles = ["Trip basics","Invite friends","Import route","Gear template"];
   const update = (k,v) => setForm(f=>({...f,[k]:v}));
+
+  const templateOptions = [
+    ...templates.map(t => ({
+      id: t.name,
+      name: t.description || t.name,
+      sub: Array.isArray(t.itemIds) ? `${t.itemIds.length} items` : "",
+    })),
+    { id: "blank", name: "Start empty", sub: "" },
+  ];
+
+  const submit = async () => {
+    if (!form.name.trim() || !form.startDate || !form.endDate) {
+      setErr("Name, start date, and end date are required.");
+      setStep(1);
+      return;
+    }
+    setSubmitting(true); setErr(null);
+    try {
+      const emails = form.emails.split(",").map(s => s.trim()).filter(Boolean);
+      const payload = {
+        name: form.name.trim(),
+        country: form.country.trim() || undefined,
+        type: form.type,
+        startDate: form.startDate,
+        endDate: form.endDate,
+        templateId: form.template === "blank" ? undefined : form.template,
+        participants: emails.map((email) => ({
+          name: email.split("@")[0],
+          email,
+        })),
+      };
+      if (onSubmit) await onSubmit(payload);
+    } catch (e) {
+      setErr(e.message || "Could not create trip");
+      setSubmitting(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center">
@@ -795,6 +942,11 @@ const NewTripModal = ({ onClose }) => {
             <div>
               <label className="block text-xs font-mono mb-2" style={{ color: "#7A8471" }}>Trip name</label>
               <input value={form.name} onChange={e=>update("name",e.target.value)} placeholder="e.g. Kangaroo Valley, 3 Days"
+                className="w-full px-4 py-3 rounded-xl text-sm outline-none" style={{ backgroundColor:"#E8E2D4", color:"#1F1F1E" }} />
+            </div>
+            <div>
+              <label className="block text-xs font-mono mb-2" style={{ color: "#7A8471" }}>Country / region</label>
+              <input value={form.country} onChange={e=>update("country",e.target.value)} placeholder="e.g. Wodi Wodi Country"
                 className="w-full px-4 py-3 rounded-xl text-sm outline-none" style={{ backgroundColor:"#E8E2D4", color:"#1F1F1E" }} />
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -846,7 +998,7 @@ const NewTripModal = ({ onClose }) => {
           {step === 4 && <>
             <p className="text-sm leading-relaxed" style={{ color: "#7A8471" }}>Choose a starting gear template. Customise it after creating the trip.</p>
             <div className="space-y-2">
-              {[{id:"bikepacking-3day",name:"Bikepacking — 3 day",sub:"14 items · 4.5kg"},{id:"ultralight-hike",name:"Ultralight hiking",sub:"10 items · 2.8kg"},{id:"blank",name:"Start empty",sub:""}].map(t=>(
+              {templateOptions.map(t=>(
                 <label key={t.id} onClick={()=>update("template",t.id)}
                   className="flex items-center gap-4 p-4 rounded-xl cursor-pointer"
                   style={{ backgroundColor:"#E8E2D4", outline: form.template===t.id ? `2px solid #2D3E2F` : "none", outlineOffset:"0px" }}>
@@ -861,16 +1013,18 @@ const NewTripModal = ({ onClose }) => {
               ))}
             </div>
           </>}
+          {err && <p className="text-xs font-mono" style={{ color: "#A64B2A" }}>{err}</p>}
         </div>
 
         <div className="flex gap-2 p-6">
           {step > 1 && (
-            <button onClick={()=>setStep(s=>s-1)} className="flex-1 py-3 rounded-xl text-sm font-medium"
-              style={{ backgroundColor:"#E8E2D4", color:"#1F1F1E" }}>Back</button>
+            <button disabled={submitting} onClick={()=>setStep(s=>s-1)} className="flex-1 py-3 rounded-xl text-sm font-medium"
+              style={{ backgroundColor:"#E8E2D4", color:"#1F1F1E", opacity: submitting ? 0.5 : 1 }}>Back</button>
           )}
-          <button onClick={()=>step<totalSteps?setStep(s=>s+1):onClose()} className="flex-1 py-3 rounded-xl text-sm font-medium"
-            style={{ backgroundColor:"#2D3E2F", color:"#F4F1EA" }}>
-            {step === totalSteps ? "Create trip" : "Continue"}
+          <button disabled={submitting} onClick={()=> step<totalSteps ? setStep(s=>s+1) : submit()}
+            className="flex-1 py-3 rounded-xl text-sm font-medium"
+            style={{ backgroundColor:"#2D3E2F", color:"#F4F1EA", opacity: submitting ? 0.6 : 1 }}>
+            {submitting ? "Creating…" : (step === totalSteps ? "Create trip" : "Continue")}
           </button>
         </div>
       </div>
@@ -879,10 +1033,35 @@ const NewTripModal = ({ onClose }) => {
 };
 
 // ─── EXPORT VIEW ──────────────────────────────────────────────────────
-const ExportView = ({ trip }) => {
-  const gearById = {};
-  DEMO_DATA.gearLibrary.forEach(g => { gearById[g.id] = g; });
-  const template = DEMO_DATA.gearTemplate["bikepacking-3day"];
+const ExportView = ({ tripId }) => {
+  const [trip, setTrip] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  React.useEffect(() => {
+    if (!tripId) return;
+    setLoading(true); setError(null);
+    TraverseAPI.getTrip(tripId)
+      .then(setTrip)
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [tripId]);
+
+  if (loading) return (
+    <div className="flex-1 flex items-center justify-center" style={{ backgroundColor: "#F4F1EA" }}>
+      <p className="font-mono text-xs tracking-widest uppercase" style={{ color: "#7A8471" }}>Loading trip…</p>
+    </div>
+  );
+  if (error || !trip) return (
+    <div className="flex-1 flex items-center justify-center" style={{ backgroundColor: "#F4F1EA" }}>
+      <p className="font-mono text-sm" style={{ color: "#7A8471" }}>{error || "Trip not found."}</p>
+    </div>
+  );
+
+  const gearGroups = ["Sleep","Cook","Wear","Ride","Safety","Documents"].map(cat => ({
+    cat,
+    items: (trip.gear || []).filter(g => g.category === cat),
+  })).filter(group => group.items.length > 0);
 
   return (
     <div className="flex-1 overflow-y-auto" style={{ backgroundColor: "#F4F1EA" }}>
@@ -954,9 +1133,11 @@ const ExportView = ({ trip }) => {
 
           <div style={{ borderTop:"1px solid #E8E2D4", paddingTop:"1.5rem" }}>
             <SectionLabel>Gear list</SectionLabel>
-            {Object.entries(template).map(([cat,ids])=>{
-              const items = ids.map(id=>gearById[id]).filter(Boolean);
-              return <div key={cat} className="mb-4">
+            {gearGroups.length === 0 && (
+              <p className="text-xs font-mono" style={{ color:"#7A8471" }}>No gear attached yet.</p>
+            )}
+            {gearGroups.map(({ cat, items })=> (
+              <div key={cat} className="mb-4">
                 <p className="text-xs font-mono mb-1.5 uppercase tracking-widest" style={{ color:"#7A8471" }}>{cat}</p>
                 {items.map(item=>(
                   <div key={item.id} className="flex justify-between py-1.5" style={{ borderBottom:"1px solid #F4F1EA" }}>
@@ -964,8 +1145,8 @@ const ExportView = ({ trip }) => {
                     <p className="font-mono text-xs" style={{ color:"#7A8471" }}>{item.weight>0?`${item.weight}g`:"—"}</p>
                   </div>
                 ))}
-              </div>;
-            })}
+              </div>
+            ))}
           </div>
 
           <div style={{ borderTop:"1px solid #E8E2D4", paddingTop:"1.5rem" }}>
@@ -979,15 +1160,17 @@ const ExportView = ({ trip }) => {
             ))}
           </div>
 
-          <div style={{ borderTop:"1px solid #E8E2D4", paddingTop:"1.5rem" }}>
-            <SectionLabel>Emergency contacts</SectionLabel>
-            {[{name:"NSW SES",number:"132 500"},{name:"Police Assistance",number:"131 444"},{name:"Sarah Chen (in-party)",number:"+61 412 xxx xxx"}].map(c=>(
-              <div key={c.name} className="flex justify-between py-1.5" style={{ borderBottom:"1px solid #F4F1EA" }}>
-                <span className="text-xs" style={{ color:"#1F1F1E" }}>{c.name}</span>
-                <span className="font-mono text-xs" style={{ color:"#A64B2A" }}>{c.number}</span>
-              </div>
-            ))}
-          </div>
+          {(trip.emergencyContacts||[]).length > 0 && (
+            <div style={{ borderTop:"1px solid #E8E2D4", paddingTop:"1.5rem" }}>
+              <SectionLabel>Emergency contacts</SectionLabel>
+              {trip.emergencyContacts.map(c=>(
+                <div key={c.name} className="flex justify-between py-1.5" style={{ borderBottom:"1px solid #F4F1EA" }}>
+                  <span className="text-xs" style={{ color:"#1F1F1E" }}>{c.name}</span>
+                  <span className="font-mono text-xs" style={{ color:"#A64B2A" }}>{c.number}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

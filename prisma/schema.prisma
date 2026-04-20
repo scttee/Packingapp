@@ -1,0 +1,203 @@
+// Traverse data model
+// Provider is sqlite for fast local + Railway one-volume MVP.
+// Switch to "postgresql" + DATABASE_URL=postgres://... and re-run `prisma migrate dev`
+// to move to a real Postgres without changing application code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  name        String
+  avatarUrl   String?
+  createdAt   DateTime @default(now())
+
+  trips       Trip[]
+  gearItems   GearItem[]
+  templates   GearTemplate[]
+  locations   LiveLocation[]
+}
+
+model Trip {
+  id              String   @id @default(cuid())
+  userId          String
+  name            String
+  country         String?
+  status          String   @default("draft")
+  type            String   @default("bike")
+  startDate       DateTime?
+  endDate         DateTime?
+  distanceKm      Float?
+  elevationM      Float?
+  summary         String?
+  komootUrl       String?
+  stravaUrl       String?
+  gpxFileUrl      String?
+  trackingEnabled Boolean  @default(false)
+  trackingToken   String?  @unique
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  segments        TripSegment[]
+  accommodations  Accommodation[]
+  waypoints       Waypoint[]
+  cafes           Cafe[]
+  meals           MealPlan[]
+  participants    TripParticipant[]
+  gearList        TripGear[]
+  locations       LiveLocation[]
+  emergencyContacts EmergencyContact[]
+}
+
+model TripParticipant {
+  id        String  @id @default(cuid())
+  tripId    String
+  userId    String?
+  email     String?
+  name      String
+  initials  String
+  confirmed Boolean @default(false)
+
+  trip      Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model TripSegment {
+  id           String  @id @default(cuid())
+  tripId       String
+  dayNumber    Int
+  name         String
+  distanceKm   Float
+  elevationM   Float
+  surface      String?
+  notes        String?
+  actualKm     Float?
+
+  trip         Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model Accommodation {
+  id           String  @id @default(cuid())
+  tripId       String
+  nightNumber  Int
+  name         String
+  type         String?
+  notes        String?
+  lat          Float?
+  lng          Float?
+
+  trip         Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model Waypoint {
+  id           String  @id @default(cuid())
+  tripId       String
+  kmFromStart  Float
+  name         String
+  type         String?
+  notes        String?
+  lat          Float?
+  lng          Float?
+
+  trip         Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model Cafe {
+  id                 String @id @default(cuid())
+  tripId             String
+  name               String
+  distanceFromRoute  String?
+  notes              String?
+
+  trip               Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model MealPlan {
+  id                 String @id @default(cuid())
+  tripId             String
+  dayNumber          Int
+  breakfastName      String?
+  breakfastWeightG   Int?
+  breakfastNotes     String?
+  lunchName          String?
+  lunchWeightG       Int?
+  lunchNotes         String?
+  dinnerName         String?
+  dinnerWeightG      Int?
+  dinnerNotes        String?
+  snacks             String?
+  totalFoodWeightG   Int?
+
+  trip               Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model GearItem {
+  id           String   @id @default(cuid())
+  userId       String
+  name         String
+  brand        String?
+  category     String
+  weightG      Int      @default(0)
+  description  String?
+  imageUrl     String?
+  sourceUrl    String?
+  lastUsedDate DateTime?
+  createdAt    DateTime @default(now())
+
+  user         User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tripGear     TripGear[]
+}
+
+model TripGear {
+  id              String  @id @default(cuid())
+  tripId          String
+  gearItemId      String
+  packed          Boolean @default(false)
+  overrideWeightG Int?
+
+  trip            Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  gearItem        GearItem @relation(fields: [gearItemId], references: [id], onDelete: Cascade)
+
+  @@unique([tripId, gearItemId])
+}
+
+model GearTemplate {
+  id          String @id @default(cuid())
+  userId      String?
+  name        String
+  description String?
+  itemIds     String
+
+  user        User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model EmergencyContact {
+  id      String @id @default(cuid())
+  tripId  String
+  name    String
+  number  String
+
+  trip    Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model LiveLocation {
+  id         String   @id @default(cuid())
+  tripId     String
+  userId     String
+  lat        Float
+  lng        Float
+  accuracy   Float?
+  recordedAt DateTime @default(now())
+
+  trip       Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  user       User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tripId, recordedAt])
+}
