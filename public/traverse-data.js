@@ -65,12 +65,16 @@ const TraverseAPI = {
     return jsonFetch(`/api/weather?${qs}`).catch(() => []);
   },
 
-  uploadGpx: async (tripId, file) => {
+  uploadGpx: async (tripId, file, segmentId) => {
     const fd = new FormData();
     fd.append("file", file);
     if (tripId) fd.append("tripId", tripId);
+    if (segmentId) fd.append("segmentId", segmentId);
     const r = await fetch("/api/import/gpx", { method: "POST", credentials: "same-origin", body: fd });
-    if (!r.ok) throw new Error(`${r.status}`);
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || `${r.status}`);
+    }
     return r.json();
   },
 };

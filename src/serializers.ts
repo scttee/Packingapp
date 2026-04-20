@@ -17,6 +17,10 @@ function daysBetween(a: Date, b: Date): number {
   return Math.max(0, Math.round((a.getTime() - b.getTime()) / 86400000));
 }
 
+function safeParse(json: string): unknown {
+  try { return JSON.parse(json); } catch { return null; }
+}
+
 export function shapeTrip(trip: FullTrip) {
   const today = new Date();
   const daysUntil = trip.startDate ? daysBetween(trip.startDate, today) : null;
@@ -41,6 +45,7 @@ export function shapeTrip(trip: FullTrip) {
     trackingEnabled: trip.trackingEnabled,
     trackingToken: trip.trackingToken,
     trackingLink: trip.trackingToken ? `/share/${trip.trackingToken}` : null,
+    track: trip.trackGeoJson ? safeParse(trip.trackGeoJson) : null,
     participants: trip.participants
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((p) => ({ id: p.id, name: p.name, initials: p.initials, confirmed: p.confirmed })),
@@ -55,6 +60,7 @@ export function shapeTrip(trip: FullTrip) {
         surface: s.surface,
         notes: s.notes,
         actualKm: s.actualKm,
+        track: s.trackGeoJson ? safeParse(s.trackGeoJson) : null,
       })),
     accommodation: trip.accommodations
       .sort((a, b) => a.nightNumber - b.nightNumber)

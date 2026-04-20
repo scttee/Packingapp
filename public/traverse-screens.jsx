@@ -1,7 +1,7 @@
 // Traverse — Screens v2 (visual refresh + gear lookup + replanning)
 
 const { useState, useRef } = React;
-const { TopoPattern, Avatar, Badge, SectionLabel, Card, Toggle, WeatherIcon } = window;
+const { TopoPattern, Avatar, Badge, SectionLabel, Card, Toggle, WeatherIcon, RouteMap } = window;
 
 // ─── Add Gear Panel (Claude URL lookup) ──────────────────────────────
 const AddGearPanel = ({ onClose, onAdd }) => {
@@ -405,7 +405,7 @@ const TripsDashboard = ({ trips, onOpenTrip, onNewTrip }) => {
 
 
 // ─── TRIP DETAIL ──────────────────────────────────────────────────────
-const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearToTrip, onUpdateSegment, onToggleTracking }) => {
+const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearToTrip, onUpdateSegment, onToggleTracking, onRefreshTrip }) => {
   const [tab, setTab] = useState("Overview");
   const tabs = ["Overview","Route","Gear","Logistics","Live"];
   const [importUrl, setImportUrl] = useState("");
@@ -441,9 +441,27 @@ const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearT
     setGpxStatus({ kind: "loading" });
     try {
       const res = await TraverseAPI.uploadGpx(trip.id, f);
-      setGpxStatus({ kind: "ok", summary: res });
+      setGpxStatus({ kind: "ok", summary: res, scope: "trip" });
+      if (onRefreshTrip) await onRefreshTrip();
     } catch (err) {
       setGpxStatus({ kind: "error", message: err.message });
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const onSegmentGpx = async (seg, e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setGpxStatus({ kind: "loading" });
+    try {
+      const res = await TraverseAPI.uploadGpx(trip.id, f, seg.id);
+      setGpxStatus({ kind: "ok", summary: res, scope: "segment", day: seg.day });
+      if (onRefreshTrip) await onRefreshTrip();
+    } catch (err) {
+      setGpxStatus({ kind: "error", message: err.message });
+    } finally {
+      e.target.value = "";
     }
   };
 
@@ -538,15 +556,12 @@ const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearT
 
         {/* ROUTE */}
         {tab === "Route" && <>
-          <div className="relative rounded-2xl h-52 overflow-hidden" style={{ backgroundColor: "#2D3E2F" }}>
-            <TopoPattern opacity={0.15} />
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
-              <p className="font-mono text-xs tracking-widest uppercase" style={{ color: "#7A8471" }}>Route map</p>
-              <p className="font-mono text-xs" style={{ color: "#7A8471" }}>
-                {(trip.waypoints||[]).filter(w=>w.lat!=null).length} waypoints · Mapbox coming soon
-              </p>
-            </div>
-          </div>
+          <RouteMap
+            waypoints={trip.waypoints || []}
+            segments={trip.segments || []}
+            tripTrack={trip.track}
+            height={300}
+          />
           <div>
             <SectionLabel>Import route</SectionLabel>
             <div className="space-y-2">
@@ -555,7 +570,7 @@ const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearT
                   className="flex-1 px-4 py-3 rounded-xl text-sm font-mono outline-none"
                   style={{ backgroundColor: "#E8E2D4", color: "#1F1F1E" }} />
                 <button
-                  onClick={() => alert("Komoot / Strava import requires API credentials — coming soon")}
+                  onClick={() => alert("Komoot / Strava import requires API credentials — for now, export the tour as GPX and upload it on a segment below.")}
                   className="px-4 py-3 rounded-xl text-sm font-medium" style={{ backgroundColor: "#2D3E2F", color: "#F4F1EA" }}>Import</button>
               </div>
               <input ref={fileInputRef} type="file" accept=".gpx,application/gpx+xml" className="hidden" onChange={onGpxFile} />
@@ -563,12 +578,12 @@ const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearT
                 className="w-full py-3 rounded-xl text-sm font-mono flex items-center justify-center gap-2"
                 style={{ border: "1.5px dashed #D4CEC3", color: "#7A8471" }}>
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M4 6l4-4 4 4M2 12h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                Upload .gpx file
+                Upload whole-trip .gpx file
               </button>
               {gpxStatus?.kind === "loading" && <p className="text-xs font-mono" style={{ color: "#7A8471" }}>Parsing GPX…</p>}
               {gpxStatus?.kind === "ok" && (
                 <p className="text-xs font-mono" style={{ color: "#2D3E2F" }}>
-                  Imported · {gpxStatus.summary.distanceKm}km · ↑{gpxStatus.summary.elevationGainM}m · {gpxStatus.summary.pointCount} points
+                  Imported {gpxStatus.scope === "segment" ? `day ${gpxStatus.day}` : "trip"} · {gpxStatus.summary.distanceKm}km · ↑{gpxStatus.summary.elevationGainM}m · {gpxStatus.summary.pointCount} points
                 </p>
               )}
               {gpxStatus?.kind === "error" && <p className="text-xs font-mono" style={{ color: "#A64B2A" }}>GPX import failed — {gpxStatus.message}</p>}
@@ -591,6 +606,16 @@ const TripDetail = ({ trip, gearLibrary = [], onBack, onTogglePacked, onAddGearT
                   </div>
                   <p className="text-xs font-mono" style={{ color: "#7A8471" }}>{seg.surface}</p>
                   {seg.notes && <p className="text-xs mt-2 leading-relaxed" style={{ color: "#1F1F1E" }}>{seg.notes}</p>}
+                  <div className="flex items-center justify-between mt-3 pt-3" style={{ borderTop: "1px solid #D4CEC3" }}>
+                    <span className="text-xs font-mono" style={{ color: seg.track ? "#2D3E2F" : "#7A8471" }}>
+                      {seg.track ? `Track loaded · ${seg.track.coordinates?.length||0} pts` : "No GPX track yet"}
+                    </span>
+                    <label className="text-xs font-mono cursor-pointer" style={{ color: "var(--accent, #A64B2A)" }}>
+                      {seg.track ? "Replace GPX" : "Upload GPX"}
+                      <input type="file" accept=".gpx,application/gpx+xml" className="hidden"
+                        onChange={(e) => onSegmentGpx(seg, e)} />
+                    </label>
+                  </div>
                 </div>
               ))}
             </div>

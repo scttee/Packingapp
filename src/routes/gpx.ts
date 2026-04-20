@@ -18,10 +18,21 @@ function haversine(a: { lat: number; lng: number }, b: { lat: number; lng: numbe
   return 2 * R * Math.asin(Math.sqrt(x));
 }
 
+// Downsample a dense track to ~N points to keep payloads small.
+function downsample<T>(arr: T[], maxPoints: number): T[] {
+  if (arr.length <= maxPoints) return arr;
+  const step = arr.length / maxPoints;
+  const out: T[] = [];
+  for (let i = 0; i < maxPoints; i++) out.push(arr[Math.floor(i * step)]);
+  out.push(arr[arr.length - 1]);
+  return out;
+}
+
 router.post("/", upload.single("file"), async (req, res) => {
   const userId = requireUser(req);
   if (!req.file) return res.status(400).json({ error: "file required" });
   const tripId = String(req.body?.tripId || "");
+  const segmentId = String(req.body?.segmentId || "");
   const owned = tripId
     ? await prisma.trip.findFirst({ where: { id: tripId, userId }, select: { id: true } })
     : null;
@@ -57,6 +68,10 @@ router.post("/", upload.single("file"), async (req, res) => {
     }
   }
 
+  const thinned = downsample(pts, 600);
+  const coordinates = thinned.map((p) => [p.lng, p.lat]);
+  const geoJson = JSON.stringify({ type: "LineString", coordinates });
+
   const summary = {
     name: trk?.name || req.file.originalname?.replace(/\.gpx$/i, ""),
     pointCount: pts.length,
@@ -70,15 +85,29 @@ router.post("/", upload.single("file"), async (req, res) => {
     },
     start: pts[0],
     end: pts[pts.length - 1],
+    segmentId: null as string | null,
   };
 
-  if (owned) {
+  if (owned && segmentId) {
+    const seg = await prisma.tripSegment.findFirst({ where: { id: segmentId, tripId: owned.id } });
+    if (!seg) return res.status(404).json({ error: "segment not found" });
+    await prisma.tripSegment.update({
+      where: { id: seg.id },
+      data: {
+        distanceKm: summary.distanceKm,
+        elevationM: summary.elevationGainM,
+        trackGeoJson: geoJson,
+      },
+    });
+    summary.segmentId = seg.id;
+  } else if (owned) {
     await prisma.trip.update({
       where: { id: owned.id },
       data: {
         distanceKm: summary.distanceKm,
         elevationM: summary.elevationGainM,
         gpxFileUrl: `gpx:${req.file.originalname}`,
+        trackGeoJson: geoJson,
       },
     });
   }

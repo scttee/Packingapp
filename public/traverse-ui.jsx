@@ -85,5 +85,76 @@ const WeatherIcon = ({ icon }) => {
   return <span className="font-mono text-lg">&#9730;</span>;
 };
 
+// ── Leaflet route map ──────────────────────────────────────────────────
+// Renders waypoints + segment polylines on an OpenStreetMap tile layer.
+// Each segment gets its own colour so days are distinguishable.
+const SEGMENT_COLORS = ["#A64B2A", "#2D3E2F", "#6B4226", "#4A5568", "#8B5E34", "#1F3A20"];
+
+const RouteMap = ({ waypoints = [], segments = [], tripTrack = null, height = 280 }) => {
+  const mapRef = useRef(null);
+  const elRef  = useRef(null);
+  const layerRef = useRef(null);
+
+  useEffect(() => {
+    if (!elRef.current || !window.L) return;
+    if (!mapRef.current) {
+      mapRef.current = window.L.map(elRef.current, { zoomControl: true, scrollWheelZoom: false }).setView([-34.72, 150.5], 11);
+      window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: "© OpenStreetMap",
+      }).addTo(mapRef.current);
+    }
+    // Clear previous layers
+    if (layerRef.current) mapRef.current.removeLayer(layerRef.current);
+    const group = window.L.featureGroup().addTo(mapRef.current);
+    layerRef.current = group;
+
+    // Segment polylines
+    let colourIdx = 0;
+    const drawLine = (coords, colour, weight = 3.5) => {
+      if (!coords || !coords.length) return;
+      const latlngs = coords.map(([lng, lat]) => [lat, lng]);
+      window.L.polyline(latlngs, { color: colour, weight, opacity: 0.85 }).addTo(group);
+    };
+
+    segments.forEach(seg => {
+      if (seg.track?.coordinates?.length) {
+        drawLine(seg.track.coordinates, SEGMENT_COLORS[colourIdx % SEGMENT_COLORS.length]);
+        colourIdx++;
+      }
+    });
+    // Trip-level track as fallback if no segment tracks
+    if (!colourIdx && tripTrack?.coordinates?.length) {
+      drawLine(tripTrack.coordinates, "#A64B2A", 4);
+    }
+
+    // Waypoint markers
+    waypoints.filter(w => w.lat != null && w.lng != null).forEach(w => {
+      const marker = window.L.circleMarker([w.lat, w.lng], {
+        radius: 6,
+        color: "#0D1A0E",
+        fillColor: "#F4F1EA",
+        fillOpacity: 1,
+        weight: 2,
+      }).addTo(group);
+      const label = `<div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #1F1F1E"><strong>${w.name}</strong>${w.notes ? `<br/>${w.notes}` : ""}</div>`;
+      marker.bindTooltip(label, { direction: "top", offset: [0, -4] });
+    });
+
+    // Fit bounds
+    const bounds = group.getBounds();
+    if (bounds.isValid()) {
+      mapRef.current.fitBounds(bounds, { padding: [24, 24], maxZoom: 13 });
+    }
+  }, [JSON.stringify(waypoints), JSON.stringify(segments.map(s => [s.id, s.track?.coordinates?.length])), JSON.stringify(tripTrack)]);
+
+  useEffect(() => {
+    // Guard against Leaflet init-before-layout
+    if (mapRef.current) setTimeout(() => mapRef.current.invalidateSize(), 60);
+  }, []);
+
+  return <div ref={elRef} className="rounded-2xl overflow-hidden" style={{ height, width: "100%", backgroundColor: "#2D3E2F" }} />;
+};
+
 // Export all
-Object.assign(window, { TopoPattern, Avatar, Badge, SectionLabel, Card, Toggle, WeatherIcon });
+Object.assign(window, { TopoPattern, Avatar, Badge, SectionLabel, Card, Toggle, WeatherIcon, RouteMap });
