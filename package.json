@@ -10,10 +10,9 @@
     "prisma:migrate": "prisma migrate deploy",
     "prisma:reset": "prisma migrate reset --force",
     "seed": "node --enable-source-maps dist/seed.js",
-    "start": "node --enable-source-maps dist/index.js",
-    "dev": "tsc -p tsconfig.json --watch & nodemon --watch dist dist/index.js",
-    "postinstall": "prisma generate",
-    "release": "prisma migrate deploy && (node dist/seed.js || true)"
+    "start": "node --enable-source-maps dist/start.js",
+    "dev": "tsc -p tsconfig.json --watch & nodemon --watch dist dist/start.js",
+    "postinstall": "prisma generate"
   },
   "engines": {
     "node": ">=20"
