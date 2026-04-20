@@ -1,0 +1,12 @@
+{
+  "name": "traverse",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Traverse — bikepacking trip planning app",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
